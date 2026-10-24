@@ -59,6 +59,11 @@ Generation in the game.
 - `dlssg-install` enables OptiScaler's `SpoofHAGS` and `dlssg-run` sets `HwSchMode=2` in the Proton prefix
   (`DLSSG_HAGS=0` to skip). Some games only offer DLSS-G with hardware GPU scheduling, which Wine reports as off.
 - Some games disable DLSS-G under Wine. The Witcher 3 needs an exe patch, which is not included.
+- In The Witcher 3 with DLSS-G on, Streamline creates Ray Reconstruction before the game's first camera constants, so
+  the parameters have no `WorldToViewMatrix`/`ViewToClipMatrix` yet. d4r then keeps Ray Reconstruction on its CUDA
+  backend for the whole session (about 10 ms more per frame). The host puts identity placeholders in the parameters at
+  creation; the game's own matrices replace them once it sets them. `RrCreateMatrices=0` in `dlssg_host.ini` turns this
+  off.
 - Don't use this in online games with anti-cheat.
 
 The Witcher 3, RX 9070, 2560x1440, RT on:

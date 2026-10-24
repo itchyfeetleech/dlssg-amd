@@ -19,7 +19,8 @@
 // when present, else none), FG=<DLSS-G DLL> (default nvngx_dlssg.dll; relative paths are taken from the game's
 // executable folder), ArchID=0x1b0,
 // FGEnabled=1, LogLevel=1 (0 off, 1 on, 2 verbose), Timing=1, Log=1, Lite=0 (1: FG Lite, DLSS-G >= 310.9.16, UI
-// recomposition off), DumpDir/DumpAt/DumpReal (test captures).  Log: dlssg_host.log next to this DLL.
+// recomposition off), RrCreateMatrices=1 (see rrCreateMatrices), DumpDir/DumpAt/DumpReal (test captures).
+// Log: dlssg_host.log next to this DLL.
 #define WIDL_EXPLICIT_AGGREGATE_RETURNS
 #include <windows.h>
 #include <d3d12.h>
@@ -115,6 +116,7 @@ std::mutex g_lock, g_logLock;
 HMODULE g_next = nullptr, g_fg = nullptr;
 bool g_loaded = false, g_fgEnabled = true, g_fgInited = false, g_standalone = false;
 unsigned g_arch = 0x1b0, g_logLevel = 1, g_timing = 1;
+unsigned g_rrCreateMatrices = 1; // RrCreateMatrices=1: camera matrices on Ray Reconstruction's CreateFeature (see rrCreateMatrices)
 unsigned g_lite = 0;             // Lite=1: create DLSS-G with DLSSG.LiteCandidateBlendingEnabled (DLSS-G >= 310.9.16)
 std::wstring g_dumpDir;          // DumpDir=<dir>: write the inputs + parameters of DumpReal real frames (test captures)
 unsigned g_dumpAt = 600, g_dumpReal = 0;
@@ -195,6 +197,7 @@ void load()
     g_logLevel = iniUInt(L"LogLevel", 1);
     g_timing = iniUInt(L"Timing", 1);
     g_lite = iniUInt(L"Lite", 0);
+    g_rrCreateMatrices = iniUInt(L"RrCreateMatrices", 1);
     g_dumpDir = iniString(L"DumpDir", L"");
     g_dumpAt = iniUInt(L"DumpAt", 600);
     g_dumpReal = iniUInt(L"DumpReal", 0);
@@ -453,6 +456,29 @@ EXPORT NgxResult NVSDK_NGX_UpdateFeature(const void* appId, unsigned int feature
     NEXT(T, "NVSDK_NGX_UpdateFeature", appId, feature);
 }
 
+// Ray Reconstruction (feature 13) camera matrices at creation. In The Witcher 3 with DLSS-G on, Streamline creates the
+// denoiser before the game's first camera constants exist, so the parameter block carries no WorldToViewMatrix or
+// ViewToClipMatrix yet. d4r checks for them once, on the feature's first evaluate, and without them serves Ray
+// Reconstruction from its CUDA backend for the whole session (RX 9070 XT, 1280x720 -> 1440p: about 10 ms more per
+// frame). A missing matrix gets an identity placeholder in the block at creation; the host does not touch evaluates,
+// and the game's own matrices replace the placeholder once it registers them (The Witcher 3 does on every evaluate).
+static const unsigned int kFeatureRR = 13;
+
+static void rrCreateMatrices(void* params)
+{
+    static float identity[2][16];
+    static const char* const names[2] = {"WorldToViewMatrix", "ViewToClipMatrix"};
+    if (!g_rrCreateMatrices || !params) return;
+    for (int i = 0; i < 2; ++i) {
+        void* v = nullptr;
+        if (!failed(ms::getPtr(params, names[i], &v)) && v) continue;
+        std::memset(identity[i], 0, sizeof identity[i]);
+        for (int k = 0; k < 4; ++k) identity[i][k * 5] = 1.0f;
+        ms::setPtr(params, names[i], identity[i]);
+        logf("CreateFeature(Ray Reconstruction): no %s yet, identity placeholder for creation", names[i]);
+    }
+}
+
 EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(void* list, unsigned int feature, void* params, NgxHandle** handle)
 {
     using T = NgxResult (*)(void*, unsigned int, void*, NgxHandle**);
@@ -484,6 +510,7 @@ EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(void* list, unsigned int feature,
         return r;
     }
     auto f = fn<T>(g_next, "NVSDK_NGX_D3D12_CreateFeature");
+    if (feature == kFeatureRR) rrCreateMatrices(params);
     NgxResult r = f ? f(list, feature, params, handle) : kFail;
     logf("CreateFeature(feature %u) -> next 0x%08X", feature, r);
     return r;
