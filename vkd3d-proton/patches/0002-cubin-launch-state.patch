@@ -1,0 +1,97 @@
+From 8648ee86f75aec0a5aa7a88aa7b81cc7cd4d4e90 Mon Sep 17 00:00:00 2001
+From: itchyfeetleech <169226071+itchyfeetleech@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:13:16 +1300
+Subject: [PATCH] vkd3d: Re-emit command list state after cubin launches
+
+---
+ libs/vkd3d/command.c                | 16 ++++++++++++++++
+ libs/vkd3d/command_list_vkd3d_ext.c |  8 +++++---
+ libs/vkd3d/device.c                 |  2 ++
+ libs/vkd3d/vkd3d_private.h          |  2 ++
+ 4 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 916a39b4..fc30b8d1 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -11639,6 +11639,22 @@ static void d3d12_command_list_end_transfer_batch(struct d3d12_command_list *lis
+     }
+ }
+ 
++/* Work recorded straight into the Vulkan command buffer behind vkd3d's back (cubin launches through
++ * VK_NVX_binary_import): no render pass may be open, pending batched transfers must be in the command buffer
++ * first, and afterwards every piece of compute/graphics state vkd3d believes is bound has to be emitted again,
++ * because the launch implementation binds its own pipeline, descriptor sets and push constants. */
++void d3d12_command_list_begin_external_compute(struct d3d12_command_list *list)
++{
++    d3d12_command_list_end_current_render_pass(list, false);
++    d3d12_command_list_end_transfer_batch(list, true);
++}
++
++void d3d12_command_list_end_external_compute(struct d3d12_command_list *list)
++{
++    d3d12_command_list_invalidate_all_state(list);
++    list->descriptor_heap.buffers.global_heap_dirty = true;
++}
++
+ static void d3d12_command_list_end_wbi_batch(struct d3d12_command_list *list)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+diff --git a/libs/vkd3d/command_list_vkd3d_ext.c b/libs/vkd3d/command_list_vkd3d_ext.c
+index d91a42e8..11172047 100644
+--- a/libs/vkd3d/command_list_vkd3d_ext.c
++++ b/libs/vkd3d/command_list_vkd3d_ext.c
+@@ -85,12 +85,13 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_LaunchCubinShaderE
+     TRACE("iface %p, handle %p, block_x %u, block_y %u, block_z %u, smem_size %u, params %p, param_size %u, raw_params %p, raw_params_count %u\n",
+            iface, handle, block_x, block_y, block_z, smem_size, params, param_size, raw_params, raw_params_count);
+ 
+-    d3d12_command_list_flush_dgc_batch(command_list);
+-    d3d12_command_list_update_global_descriptor_heap(command_list);
+-
+     if (!handle || !params || !param_size)
+         return E_INVALIDARG;
+ 
++    d3d12_command_list_flush_dgc_batch(command_list);
++    d3d12_command_list_begin_external_compute(command_list);
++    d3d12_command_list_update_global_descriptor_heap(command_list);
++
+     launchInfo.function = handle->vkCuFunction;
+     launchInfo.gridDimX = block_x;
+     launchInfo.gridDimY = block_y;
+@@ -106,6 +107,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_vkd3d_ext_LaunchCubinShaderE
+     
+     vk_procs = &command_list->device->vk_procs;
+     VK_CALL(vkCmdCuLaunchKernelNVX(command_list->cmd.vk_command_buffer, &launchInfo));
++    d3d12_command_list_end_external_compute(command_list);
+     return S_OK;
+ }
+ 
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index e8ea6e55..95bca286 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -5809,6 +5809,8 @@ static void STDMETHODCALLTYPE d3d12_device_CreateUnorderedAccessView_default(d3d
+             if ((vr = VK_CALL(vkGetImageViewAddressNVX(device->vk_device, imageViewHandleInfo.imageView, &out_info))) < 0)
+             {
+                 ERR("Failed to get imageview address, vr %d.\n", vr);
++                /* Disarm the capture anyway: the caller's struct may be gone by the next UAV creation. */
++                d3d12_uav_info = NULL;
+                 return;
+             }
+ 
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 62ec2025..e3bd8cc6 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -3576,6 +3576,8 @@ bool d3d12_command_list_reset_query(struct d3d12_command_list *list,
+         VkQueryPool vk_pool, uint32_t index);
+ void d3d12_command_list_end_current_render_pass(struct d3d12_command_list *list, bool suspend);
+ void d3d12_command_list_invalidate_all_state(struct d3d12_command_list *list);
++void d3d12_command_list_begin_external_compute(struct d3d12_command_list *list);
++void d3d12_command_list_end_external_compute(struct d3d12_command_list *list);
+ 
+ void d3d12_command_list_debug_mark_label(struct d3d12_command_list *list, const char *tag,
+         float r, float g, float b, float a);
+-- 
+2.56.0
+

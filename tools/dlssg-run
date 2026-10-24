@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# dlssg-run: Steam launch wrapper for a game set up with dlssg-install. Launch options:
+#   /path/to/dlssg-amd/tools/dlssg-run %command%
+# Finds the game folder holding dlssg/install.json (DLSSG_GAME_DIR overrides), brings the kernel cache up to date for
+# the game's DLSS-G DLL (dlssg-setup, on the host: the game itself runs in the Steam runtime container), keeps d4r's
+# next-core copy current, and starts the game with the nvxrt layer, the patched vkd3d-proton and NVIDIA identity
+# through dxvk-nvapi. Options for nvxrt come from dlssg/dlssg.env; DLSSG_OFF=1 starts the game without any of this.
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+[[ "${DLSSG_OFF:-0}" == 1 ]] && exec "$@"
+
+game=${DLSSG_GAME_DIR:-}
+if [[ -z $game ]]; then
+  for arg in "$@"; do
+    [[ $arg == *.exe || $arg == *.EXE ]] || continue
+    d=$(dirname "$arg")
+    [[ -d $d ]] || continue
+    hit=$(find "$d" -maxdepth 6 -path '*/dlssg/install.json' -print -quit 2>/dev/null || true)
+    if [[ -n $hit ]]; then game=$(dirname "$(dirname "$hit")"); break; fi
+  done
+fi
+if [[ -z $game || ! -f $game/dlssg/install.json ]]; then
+  echo "dlssg-run: no dlssg-install'ed game folder found in the command line; set DLSSG_GAME_DIR" >&2
+  exec "$@"
+fi
+st=$game/dlssg
+log=$st/dlssg-run.log
+dll=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["dll"])' "$st/install.json")
+if ! env -u LD_LIBRARY_PATH -u LD_PRELOAD "$HERE/dlssg-setup" "$dll" > "$log" 2>&1; then
+  echo "dlssg-run: kernel setup failed (see $log); starting without DLSS frame generation" >&2
+  command -v notify-send >/dev/null && env -u LD_LIBRARY_PATH -u LD_PRELOAD notify-send -u critical \
+    'DLSS frame generation' "Kernel setup failed, see $log" 2>/dev/null || true
+  exec "$@"
+fi
+# d4r updates replace d4r/nvngx.dll; the host loads the copy (a name OptiScaler's nvngx.dll hook leaves alone)
+if [[ -f $game/d4r/nvngx.dll && -f $game/d4r/d4r_dlssg_next.dll ]] && ! cmp -s "$game/d4r/nvngx.dll" "$game/d4r/d4r_dlssg_next.dll"; then
+  cp -f "$game/d4r/nvngx.dll" "$game/d4r/d4r_dlssg_next.dll"
+fi
+
+# Some games enable DLSS-G only with hardware-accelerated GPU scheduling, read from the registry (Wine has no such
+# setting): HwSchMode=2 in the Proton prefix, written while the prefix is not running (Steam starts Proton after us).
+# DLSSG_HAGS=0 leaves the registry alone.
+reg=${STEAM_COMPAT_DATA_PATH:+$STEAM_COMPAT_DATA_PATH/pfx/system.reg}
+if [[ "${DLSSG_HAGS:-1}" == 1 && -n $reg && -f $reg ]] && ! grep -q '^"HwSchMode"=dword:00000002' "$reg"; then
+  python3 -I - "$reg" <<'EOF' >> "$log" 2>&1 || true
+import re, sys, time
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='surrogateescape').read()
+sec = '[System\\\\ControlSet001\\\\Control\\\\GraphicsDrivers]'
+line = '"HwSchMode"=dword:00000002'
+i = s.find('\n' + sec)
+if i < 0:
+    s = s.rstrip('\n') + '\n\n%s %d\n%s\n' % (sec, int(time.time()), line)
+else:
+    j = s.find('\n', i + 1)                      # end of the section header line
+    if s.startswith('#time=', j + 1):
+        j = s.find('\n', j + 1)
+    k = s.find('\n[', j)                          # next section
+    body = s[j + 1:k if k >= 0 else len(s)]
+    body = re.sub(r'^"HwSchMode"=.*\n', '', body, flags=re.M)
+    s = s[:j + 1] + line + '\n' + body + (s[k:] if k >= 0 else '')
+open(p, 'w', encoding='utf-8', errors='surrogateescape').write(s)
+print('dlssg-run: HwSchMode=2 set in', p)
+EOF
+fi
+
+set -a
+# shellcheck source=/dev/null
+[[ -f $st/dlssg.env ]] && . "$st/dlssg.env"
+set +a
+export VK_ADD_LAYER_PATH="${VK_ADD_LAYER_PATH:+$VK_ADD_LAYER_PATH:}$st/layer"
+export VK_INSTANCE_LAYERS="${VK_INSTANCE_LAYERS:+$VK_INSTANCE_LAYERS:}VK_LAYER_NVXRT_nvx"
+export NVXRT_CACHE=${NVXRT_CACHE:-$HOME/.cache/nvxrt} NVXRT_LOG=${NVXRT_LOG:-$st/nvxrt.log}
+# NVIDIA identity for Streamline/the game through dxvk-nvapi (Ada; the host tells DLSS-G it runs on Blackwell)
+export PROTON_ENABLE_NVAPI=1 PROTON_FORCE_NVAPI=1 DXVK_NVAPI_ALLOW_OTHER_DRIVERS=1
+export DXVK_NVAPI_GPU_ARCH=${DXVK_NVAPI_GPU_ARCH:-AD100}
+export WINEDLLOVERRIDES="dxgi,d3d12,d3d12core=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+exec "$@"

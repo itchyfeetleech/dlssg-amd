@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# dlssg-setup DLL [CACHE]: make sure the nvxrt kernel cache holds translations (PTX -> SPIR-V) of every kernel in
+# NVIDIA's DLSS-G DLL, plus the T1 (hand-written RDNA4) replacements that match it. Runs on the host, not inside the
+# Steam runtime container (needs python3 and glslangValidator). Fast no-op when this exact DLL was set up before.
+# Everything it writes is derived from the user's own DLL and stays in the local cache (default ~/.cache/nvxrt);
+# never publish that directory.
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
+TR="$ROOT/translator"
+T1="${NVXRT_T1_DIR:-$ROOT/t1}"
+SCAN="$ROOT/nvxrt/build/nvxrt-scan"
+[[ -x "$SCAN" ]] || SCAN="$HERE/nvxrt-scan"
+DLL=${1:?usage: dlssg-setup DLL [CACHE]}
+CACHE=${2:-${NVXRT_CACHE:-$HOME/.cache/nvxrt}}
+command -v glslangValidator >/dev/null || { echo "dlssg-setup: glslangValidator not found (glslang package)" >&2; exit 1; }
+mkdir -p "$CACHE/kernels"
+sum=$(sha256sum "$DLL" | cut -d' ' -f1)
+stamp="$CACHE/setup-done.txt"
+t1files=()
+[[ -d "$T1" ]] && t1files=("$T1"/*.py)
+tver=$(cat "$TR/ptxc.py" "$TR/rt.glsl" "$TR/t1_apply.py" "${t1files[@]}" 2>/dev/null | sha256sum | cut -c1-16)
+if grep -qx "$sum $tver" "$stamp" 2>/dev/null; then
+  exit 0
+fi
+echo "dlssg-setup: translating the kernels of $DLL (sha256 ${sum:0:16}, translator $tver)"
+log="$CACHE/build-${sum:0:16}.log"
+"$SCAN" "$DLL" "$CACHE" > "$CACHE/modules-${sum:0:16}.txt"
+# modules whose PTX lists no kernel could not be read (DLSS-G 3.x stores most of its PTX encrypted)
+unreadable=$(awk 'NF <= 2' "$CACHE/modules-${sum:0:16}.txt" | grep -c . || true)
+if [[ $unreadable -gt 0 ]]; then
+  echo "dlssg-setup: $unreadable CUDA modules of this DLL cannot be read (encrypted PTX, DLSS-G 3.x?)." >&2
+  echo "dlssg-setup: use a DLSS-G 310.x nvngx_dlssg.dll instead (dlssg-install --dll PATH)" >&2
+  exit 1
+fi
+# a translator change invalidates earlier translations
+force=()
+grep -q " $tver\$" "$stamp" 2>/dev/null || force=(--force)
+python3 -I "$TR/build_cache.py" "$CACHE" "${force[@]}" > "$log" 2>&1 || {
+  echo "dlssg-setup: translation failed, see $log" >&2; exit 1; }
+tail -1 "$log"
+if grep -q '^FAIL' "$log"; then
+  echo "dlssg-setup: some kernels failed to translate (frame generation would be incomplete)" >&2
+  exit 1
+fi
+if [[ ${#t1files[@]} -gt 0 ]]; then
+  # T1 replacements are keyed by module hash + entry; kernels of other DLL versions keep their T0 translation
+  python3 -I "$TR/t1_apply.py" "$CACHE" "$T1" >> "$log" 2>&1 || {
+    echo "dlssg-setup: T1 kernels failed, see $log" >&2; exit 1; }
+  grep '^t1 applied' "$log" | tail -1
+  # fp32-accumulation variants of the T1 WMMA kernels (ENTRY.fa.spv, used with NVXRT_ACC=fast)
+  python3 -I "$TR/t1_apply.py" "$CACHE" "$T1" --acc fast >> "$log" 2>&1 || {
+    echo "dlssg-setup: fp32-accumulation variants failed, see $log" >&2; exit 1; }
+  grep '^t1 fa applied' "$log" | tail -1
+fi
+echo "$sum $tver" >> "$stamp"

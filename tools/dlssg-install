@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Install (or remove) native DLSS frame generation for one game.
+
+usage: dlssg-install GAME_DIR [--dll PATH] [--vkd3d DIR] [--exact] [--lite]
+       dlssg-install GAME_DIR --uninstall
+       dlssg-install GAME_DIR --status
+
+GAME_DIR is the folder of the game's main .exe, with OptiScaler 0.9.4 already installed there (OptiScaler.ini next to
+its DLL, e.g. dxgi.dll; a d4r release installs it too). The installer
+  - puts the NGX host (dlssg/nvngx.dll_dlssg_host.dll), its dlssg_host.ini, the nvxrt Vulkan layer and dlssg.env
+    (nvxrt options) into GAME_DIR/dlssg/,
+  - sets OptiScaler.ini [Libraries] NvngxPath to the host and [Spoofing] Dxgi=true,
+  - replaces d3d12.dll / d3d12core.dll with the patched vkd3d-proton build (vkd3d-proton/build.sh),
+  - with d4r installed (GAME_DIR/d4r/nvngx.dll): copies d4r's shim to d4r/d4r_dlssg_next.dll, the host's next core
+    (DLSS SR/RR keep working; dlssg-run keeps the copy current),
+  - translates the DLSS-G DLL's kernels into ~/.cache/nvxrt (dlssg-setup).
+Every replaced file and changed INI line is recorded in dlssg/install.json; --uninstall restores them exactly.
+Then set the game's Steam launch options to:  /path/to/dlssg-amd/tools/dlssg-run %command%
+and pick DLSS Frame Generation (2x/3x/4x) in the game.
+
+--dll PATH  DLSS-G DLL to run (default: the game's nvngx_dlssg.dll, found under GAME_DIR)
+--exact     bit-exact kernels (default: fast mode: hardware bilinear filtering, fp32 accumulation, RGBA8 candidates)
+--lite      NVIDIA's FG Lite (DLSS-G >= 310.9.16): much cheaper generated frames, softer, HUD interpolated
+"""
+import argparse, hashlib, json, os, shutil, subprocess, sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+HOST = 'nvngx.dll_dlssg_host.dll'
+STATE = 'dlssg'
+
+
+def die(msg):
+    sys.exit('dlssg-install: ' + msg)
+
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def winrel(p, base):
+    return str(Path(os.path.relpath(p, base))).replace('/', '\\')
+
+
+def ini_get(text, section, key):
+    sec = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith('[') and s.endswith(']'):
+            sec = s[1:-1]
+        elif sec == section and '=' in s and not s.startswith(';') and s.split('=', 1)[0].strip() == key:
+            return line
+    return None
+
+
+def ini_set(path, section, key, value):
+    """sets KEY in [SECTION] keeping the file's line endings and "k=v" / "k = v" style; returns the replaced line
+    (None if the key was added)"""
+    raw = Path(path).read_bytes().decode('utf-8', 'surrogateescape')
+    nl = '\r\n' if '\r\n' in raw else '\n'
+    lines = raw.split(nl)
+    sec, sec_end, old = None, None, None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('[') and s.endswith(']'):
+            if sec == section and sec_end is None:
+                sec_end = i
+            sec = s[1:-1]
+            continue
+        if sec == section and '=' in s and not s.startswith(';') and s.split('=', 1)[0].strip() == key:
+            sep = ' = ' if ' = ' in line else '='
+            old = line
+            lines[i] = key + sep + value
+            break
+    else:
+        if sec == section and sec_end is None:
+            sec_end = len(lines)
+        if sec_end is None:
+            lines += ['', '[%s]' % section, key + '=' + value]
+        else:
+            while sec_end > 0 and lines[sec_end - 1].strip() == '':
+                sec_end -= 1
+            lines.insert(sec_end, key + '=' + value)
+    Path(path).write_bytes(nl.join(lines).encode('utf-8', 'surrogateescape'))
+    return old
+
+
+def ini_restore(path, section, key, old):
+    """undoes ini_set: puts the original line back, or removes the key when it was added"""
+    raw = Path(path).read_bytes().decode('utf-8', 'surrogateescape')
+    nl = '\r\n' if '\r\n' in raw else '\n'
+    lines = raw.split(nl)
+    sec = None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('[') and s.endswith(']'):
+            sec = s[1:-1]
+        elif sec == section and '=' in s and not s.startswith(';') and s.split('=', 1)[0].strip() == key:
+            if old is None:
+                del lines[i]
+            else:
+                lines[i] = old
+            break
+    Path(path).write_bytes(nl.join(lines).encode('utf-8', 'surrogateescape'))
+
+
+def find_dll(game):
+    hits = sorted(game.rglob('nvngx_dlssg.dll'), key=lambda p: len(p.parts))
+    hits = [h for h in hits if STATE not in h.relative_to(game).parts]
+    if not hits:
+        die('no nvngx_dlssg.dll under %s; the game does not ship DLSS frame generation, or pass --dll' % game)
+    return hits[0]
+
+
+def install(a, game):
+    st = game / STATE
+    if (st / 'install.json').exists():
+        die('already installed; run --uninstall first (or edit %s/dlssg.env / dlssg_host.ini)' % st)
+    ini = game / 'OptiScaler.ini'
+    if not ini.exists():
+        die('no OptiScaler.ini in %s: install OptiScaler 0.9.4 (or a d4r release) into the game folder first' % game)
+    for f in (ROOT / 'host/build' / HOST, ROOT / 'nvxrt/build/libVkLayer_nvxrt.so'):
+        if not f.exists():
+            die('%s missing: build first (see README)' % f)
+    vk = Path(a.vkd3d or ROOT / 'vkd3d-proton/out')
+    for f in ('d3d12.dll', 'd3d12core.dll'):
+        if not (vk / f).exists():
+            die('%s missing: build vkd3d-proton (vkd3d-proton/build.sh %s) or pass --vkd3d' % (vk / f, vk))
+    dll = Path(a.dll).resolve() if a.dll else find_dll(game)
+    if not dll.exists():
+        die('%s not found' % dll)
+
+    # kernels first: a DLL the translator cannot handle leaves the game untouched
+    r = subprocess.run([str(ROOT / 'tools/dlssg-setup'), str(dll)])
+    if r.returncode:
+        die('kernel translation failed; nothing installed')
+
+    man = {'version': 1, 'files': [], 'ini': [], 'dll': str(dll)}
+    st.mkdir(exist_ok=True)
+    (st / 'backup').mkdir(exist_ok=True)
+    (st / 'layer').mkdir(exist_ok=True)
+    shutil.copy2(ROOT / 'host/build' / HOST, st / HOST)
+    shutil.copy2(ROOT / 'nvxrt/build/libVkLayer_nvxrt.so', st / 'layer/')
+    shutil.copy2(ROOT / 'nvxrt/build/nvxrt_layer.json', st / 'layer/')
+    d4r = game / 'd4r' / 'nvngx.dll'
+    next_core = 'none'
+    if d4r.exists():
+        shutil.copy2(d4r, game / 'd4r' / 'd4r_dlssg_next.dll')
+        man['files'].append({'path': 'd4r/d4r_dlssg_next.dll', 'backup': None})
+        next_core = 'd4r\\d4r_dlssg_next.dll'
+    # relative to the game executable's folder (the host resolves it there), also for a DLL elsewhere in the game's
+    # tree such as Unreal's Engine/Plugins/.../Streamline; Z: (Wine's view of /) only outside the Steam library
+    rel = Path(os.path.relpath(dll, game))
+    fg = winrel(dll, game) if rel.parts.count('..') <= 4 else 'Z:' + str(dll).replace('/', '\\')
+    (st / 'dlssg_host.ini').write_text(
+        '; NGX host (dlssg-install): feature 11 (frame generation) runs FG; everything else goes to Next.\n'
+        '; Relative paths are taken from the game executable\'s folder. ArchID 0x1b0 = Blackwell (multi-frame).\n'
+        '[Host]\nNext=%s\nFG=%s\nArchID=0x1b0\nLite=%d\nLogLevel=1\nTiming=1\nLog=1\n' % (next_core, fg, a.lite))
+    env = ['# nvxrt options for dlssg-run (dlssg-install%s)' % (' --exact' if a.exact else '')]
+    if not a.exact:
+        env += ['NVXRT_TEX=hw', 'NVXRT_ACC=fast', 'NVXRT_SHADOW=b,c']
+    (st / 'dlssg.env').write_text('\n'.join(env) + '\n')
+
+    for f in ('d3d12.dll', 'd3d12core.dll'):
+        dst = game / f
+        bak = None
+        if dst.exists():
+            bak = 'backup/' + f
+            shutil.copy2(dst, st / bak)
+        shutil.copy2(vk / f, dst)
+        man['files'].append({'path': f, 'backup': bak})
+
+    # Dxgi: the game sees an NVIDIA GPU; SpoofHAGS: Streamline enables DLSS-G only with hardware-accelerated GPU
+    # scheduling, which Wine reports as off
+    for section, key, value in (('Libraries', 'NvngxPath', STATE + '\\' + HOST), ('Spoofing', 'Dxgi', 'true'),
+                                ('Spoofing', 'SpoofHAGS', 'true')):
+        old = ini_set(ini, section, key, value)
+        man['ini'].append({'section': section, 'key': key, 'old': old})
+    man['optiscaler_ini_sha256'] = sha(ini)
+    (st / 'install.json').write_text(json.dumps(man, indent=1) + '\n')
+    print('installed into %s (DLSS-G DLL %s, next core %s, %s%s)' % (
+        st, dll.name, next_core, 'exact' if a.exact else 'fast mode', ', FG Lite' if a.lite else ''))
+    print('Steam launch options:  %s %%command%%' % (ROOT / 'tools/dlssg-run'))
+    print('Then enable DLSS Frame Generation in the game.')
+
+
+def uninstall(game):
+    st = game / STATE
+    mf = st / 'install.json'
+    if not mf.exists():
+        die('not installed in %s' % game)
+    man = json.loads(mf.read_text())
+    ini = game / 'OptiScaler.ini'
+    if ini.exists():
+        if sha(ini) != man.get('optiscaler_ini_sha256'):
+            print('note: OptiScaler.ini changed since install; restoring only the keys dlssg-install set')
+        for e in reversed(man['ini']):
+            ini_restore(ini, e['section'], e['key'], e['old'])
+    for e in man['files']:
+        dst = game / e['path']
+        if e['backup']:
+            shutil.copy2(st / e['backup'], dst)
+        elif dst.exists():
+            dst.unlink()
+    shutil.rmtree(st)
+    print('removed from %s' % game)
+
+
+def status(game):
+    st = game / STATE
+    if not (st / 'install.json').exists():
+        print('not installed')
+        return
+    man = json.loads((st / 'install.json').read_text())
+    print('installed: DLSS-G DLL', man['dll'])
+    print((st / 'dlssg_host.ini').read_text().split('[Host]')[1].strip())
+    print((st / 'dlssg.env').read_text().strip())
+    log = st / 'dlssg_host.log'
+    if log.exists():
+        print('host log (last lines):')
+        print(''.join(log.read_text(errors='replace').splitlines(True)[-5:]).rstrip())
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('game', type=Path)
+    p.add_argument('--dll')
+    p.add_argument('--vkd3d')
+    p.add_argument('--exact', action='store_true')
+    p.add_argument('--lite', type=int, nargs='?', const=1, default=0)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument('--uninstall', action='store_true')
+    g.add_argument('--status', action='store_true')
+    a = p.parse_args()
+    game = a.game.resolve()
+    if not game.is_dir():
+        die('%s is not a folder' % game)
+    if a.uninstall:
+        uninstall(game)
+    elif a.status:
+        status(game)
+    else:
+        install(a, game)
+
+
+if __name__ == '__main__':
+    main()
