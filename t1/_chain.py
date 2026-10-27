@@ -260,6 +260,7 @@ void main()
                 uint rs = int(flag) == 1 ? NvxU32(rp + uint64_t(idx) * 4ul).v : kz;
                 NvxU32(op + uint64_t(idx) * 4ul).v = packFloat2x16(unpackFloat2x16(m4) + unpackFloat2x16(rs));
             }
+            barrier();                              // other warps' staging aliases the next block's input tile
                 }
         if (gl_WorkGroupID.x < nblk) {
             uint v = gl_WorkGroupID.x;
