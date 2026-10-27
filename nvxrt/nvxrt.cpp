@@ -210,7 +210,13 @@ static std::shared_ptr<Instance> instance_of_pd(VkPhysicalDevice pd)
     X(CmdPipelineBarrier) X(QueueSubmit) X(QueueSubmit2) X(GetDeviceQueue) X(CreateImage) X(DestroyImage)          \
     X(GetImageMemoryRequirements) X(BindImageMemory) X(CmdCopyImage) X(CmdCopyImage2) X(CmdBlitImage)             \
     X(CmdBlitImage2) X(CmdResolveImage) X(CmdResolveImage2) X(CmdClearColorImage) X(CmdCopyImageToBuffer2)        \
-    X(CmdCopyBufferToImage) X(CmdCopyBufferToImage2)
+    X(CmdCopyBufferToImage) X(CmdCopyBufferToImage2) X(CmdCopyBuffer2) X(CmdFillBuffer) X(CmdUpdateBuffer)          \
+    X(CmdClearDepthStencilImage) X(CmdCopyQueryPoolResults) X(CmdBeginRenderPass) X(CmdBeginRenderPass2)          \
+    X(CmdBeginRendering) X(CmdExecuteCommands) X(CmdBuildAccelerationStructuresKHR)                                \
+    X(CmdBuildAccelerationStructuresIndirectKHR) X(CmdCopyAccelerationStructureKHR)                                \
+    X(CmdCopyAccelerationStructureToMemoryKHR) X(CmdCopyMemoryToAccelerationStructureKHR)                          \
+    X(AllocateCommandBuffers) X(FreeCommandBuffers) X(BeginCommandBuffer) X(ResetCommandBuffer) X(ResetCommandPool) \
+    X(DestroyCommandPool) X(EndCommandBuffer)
 
 struct DeviceDispatch {
 #define X(n) PFN_vk##n n = nullptr;
@@ -318,7 +324,8 @@ static const uint32_t kMaxSamplers = 4096;
 static const uint32_t kPushBytes = 256;
 static const uint32_t kQueries = 32768;
 static const uint32_t kInfoBytes = kMaxSamplers * 16 + kMaxImages * 4 * 2;
-// big parameter ring (kernels with blocks above 248 bytes); a slot is reused after kBpSlots such launches
+// big parameter ring (kernels with blocks above 248 bytes); a slot is free again once the command buffer that
+// recorded it can no longer execute (see Device::cmd_slots)
 static const uint32_t kBpSlot = 4096;
 static const uint32_t kBpSlots = 1024;
 
@@ -537,6 +544,7 @@ struct Device {
     std::vector<std::unique_ptr<Group>> groups;
     std::unordered_map<std::string, Group *> group_first;          // "hash:entry" of member 0 -> group
     std::unordered_map<VkCommandBuffer, PendingGroup> pending;
+    std::atomic<uint32_t> n_pending{0};   // pending.size(), read without the mutex by the command hooks
     std::deque<std::pair<uint32_t, Group *>> grp_recent;               // regions to check for a poisoned barrier
     std::set<VkCommandBuffer> cubin_cmds;                               // NVXRT_QUEUE_LOG: recorded launches
     std::map<VkQueue, uint64_t> cubin_queue_submits;
@@ -545,7 +553,6 @@ struct Device {
     VkDeviceMemory grp_mem = VK_NULL_HANDLE;
     uint8_t *grp_map = nullptr;
     VkDeviceAddress grp_addr = 0;
-    uint32_t grp_next = 0;
     std::unique_ptr<CuModule> grp_module;
 
     // parameter blocks above 248 bytes (meta big_params): copied into this host-visible ring at record time
@@ -553,8 +560,17 @@ struct Device {
     VkDeviceMemory bp_mem = VK_NULL_HANDLE;
     uint8_t *bp_map = nullptr;
     VkDeviceAddress bp_addr = 0;
-    uint32_t bp_next = 0;
     bool bp_failed = false;
+
+    // ring slots (group regions, big parameter slots) are owned by the command buffer that recorded them until it is
+    // begun again, reset or freed (or its pool is reset or destroyed): Vulkan only allows that once the GPU is done
+    // with it, so a pending or resubmitted command buffer always reads its own parameters
+    std::vector<uint32_t> grp_free, bp_free;
+    struct CmdSlots { std::vector<uint32_t> grp, bp; };
+    std::unordered_map<VkCommandBuffer, CmdSlots> cmd_slots;
+    std::atomic<uint32_t> n_cmd_slots{0};   // cmd_slots.size(), read without the mutex by the command buffer hooks
+    std::unordered_map<VkCommandBuffer, VkCommandPool> cmd_pool;
+    bool grp_full_logged = false, bp_full_logged = false;
 };
 
 static uint32_t format_bpp(VkFormat f);
@@ -564,6 +580,23 @@ static std::shared_ptr<Device> device_of(const void *h)
     std::lock_guard<std::mutex> lk(g_map_mutex);
     auto it = g_devices.find(dkey(h));
     return it == g_devices.end() ? nullptr : it->second;
+}
+
+// device_of without the global lock or a reference count, for hooks on frequent commands: a per-thread cache that is
+// valid while no device was created or destroyed (a device is not destroyed while its command buffers are recorded)
+static std::atomic<uint64_t> g_dev_gen{0};
+static Device *device_fast(const void *h)
+{
+    thread_local void *key = nullptr;
+    thread_local uint64_t gen = ~0ull;
+    thread_local Device *dev = nullptr;
+    uint64_t g = g_dev_gen.load(std::memory_order_acquire);
+    if (dkey(h) != key || g != gen) {
+        dev = device_of(h).get();
+        key = dkey(h);
+        gen = g;
+    }
+    return dev;
 }
 
 // ---------------------------------------------------------------------------------------------- bindless set
@@ -827,6 +860,64 @@ static bool host_ring(Device &dev, VkDeviceSize size, VkBuffer &buf, VkDeviceMem
     return ok;
 }
 
+static void ring_init(std::vector<uint32_t> &free, uint32_t n)
+{
+    free.clear();
+    for (uint32_t i = n; i-- > 0;)
+        free.push_back(i);   // taken from the back: slot 0 first
+}
+
+// a free ring slot, owned by cmd from now on; false when every slot is held by a recorded command buffer.
+// caller holds dev.mutex
+static bool ring_take(Device &dev, std::vector<uint32_t> Device::CmdSlots::*which, VkCommandBuffer cmd,
+                      uint32_t &slot)
+{
+    std::vector<uint32_t> &free = which == &Device::CmdSlots::grp ? dev.grp_free : dev.bp_free;
+    if (free.empty())
+        return false;
+    slot = free.back();
+    free.pop_back();
+    (dev.cmd_slots[cmd].*which).push_back(slot);
+    dev.n_cmd_slots.store((uint32_t)dev.cmd_slots.size(), std::memory_order_relaxed);
+    return true;
+}
+
+static void pending_changed(Device &dev)
+{
+    dev.n_pending.store((uint32_t)dev.pending.size(), std::memory_order_relaxed);
+}
+
+// cmd is no longer pending on the GPU and its recorded contents are gone: its ring slots are free again, and a group
+// it left open cannot continue. caller holds dev.mutex
+static void cmd_release(Device &dev, VkCommandBuffer cmd)
+{
+    auto it = dev.cmd_slots.find(cmd);
+    if (it != dev.cmd_slots.end()) {
+        dev.grp_free.insert(dev.grp_free.end(), it->second.grp.begin(), it->second.grp.end());
+        dev.bp_free.insert(dev.bp_free.end(), it->second.bp.begin(), it->second.bp.end());
+        dev.cmd_slots.erase(it);
+        dev.n_cmd_slots.store((uint32_t)dev.cmd_slots.size(), std::memory_order_relaxed);
+    }
+    if (dev.pending.erase(cmd))
+        pending_changed(dev);
+}
+
+// work other than a cubin launch recorded into cmd: an open launch group there must end, since its remaining members
+// would otherwise run (inside the fused dispatch) before this work instead of after it
+static void group_break(Device &dev, VkCommandBuffer cmd, const char *what)
+{
+    if (!dev.n_pending.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard<std::mutex> lk(dev.mutex);
+    auto it = dev.pending.find(cmd);
+    if (it == dev.pending.end())
+        return;
+    logf("group %s: sequence broken after %u of %zu members by %s", it->second.g->name.c_str(), it->second.next,
+         it->second.g->members.size(), what);
+    dev.pending.erase(it);
+    pending_changed(dev);
+}
+
 static void init_groups(Device &dev)
 {
     g_queue_log = getenv("NVXRT_QUEUE_LOG") && atoi(getenv("NVXRT_QUEUE_LOG")) != 0;
@@ -945,6 +1036,7 @@ static void init_groups(Device &dev)
     }
     dev.grp_map = (uint8_t *)ptr;
     memset(dev.grp_map, 0, (size_t)kGrpRegions * kGrpRegion);
+    ring_init(dev.grp_free, kGrpRegions);
     logf("launch groups: %zu active, ring %u x %u B (memory type %u)", dev.groups.size(), kGrpRegions, kGrpRegion,
          memtype);
 }
@@ -1509,6 +1601,8 @@ static void shadow_touch(Device &dev, VkImage img, bool write, const char *what)
 
 #define SHADOW_TOUCH(cmd, img, write, what)                                                                              \
     do {                                                                                                               \
+        if (dev)                                                                                                       \
+            group_break(*dev, cmd, what);                                                                              \
         if (dev && !dev->shadows.empty()) {                                                                            \
             std::lock_guard<std::mutex> lk_(dev->mutex);                                                               \
             shadow_touch(*dev, img, write, what);                                                                      \
@@ -2002,13 +2096,16 @@ static bool launch_group(Device &dev, VkCommandBuffer cmd, CuFunction &fn, const
             *(volatile uint32_t *)pg.region = pg.next;           // members the fused kernel executes
             if (g_trace)
                 logf("   group %s: member %u absorbed", pg.g->name.c_str(), pg.next - 1);
-            if (pg.next == pg.g->members.size())
+            if (pg.next == pg.g->members.size()) {
                 dev.pending.erase(pit);
+                pending_changed(dev);
+            }
             return true;
         }
         logf("group %s: sequence broken after %u of %zu members by %s", pg.g->name.c_str(), pg.next,
              pg.g->members.size(), fn.name.c_str());
         dev.pending.erase(pit);
+        pending_changed(dev);
     }
     auto git = dev.group_first.find(fn.gkey);
     if (git == dev.group_first.end() || !pbuf || psize > 256)
@@ -2038,10 +2135,16 @@ static bool launch_group(Device &dev, VkCommandBuffer cmd, CuFunction &fn, const
     VkPipeline pipe = get_pipeline(dev, *g->fn, PipeKey{g->block[0], g->block[1], g->block[2], 0});
     if (!pipe)
         return false;
-    uint32_t ri = dev.grp_next++ % kGrpRegions;
+    uint32_t ri = 0;
+    if (!ring_take(dev, &Device::CmdSlots::grp, cmd, ri)) {
+        if (!dev.grp_full_logged)
+            logf("launch groups: all %u regions held by recorded command buffers; members launch singly", kGrpRegions);
+        dev.grp_full_logged = true;
+        return false;
+    }
     uint8_t *reg = dev.grp_map + (size_t)ri * kGrpRegion;
-    // NVXRT_GROUP_PROFILE=1: fused kernels may write 64-bit realtime stamps (100 MHz) at kGrpProfOff; the slot's
-    // previous use finished long ago (the ring wraps every kGrpRegions groups): log them as deltas
+    // NVXRT_GROUP_PROFILE=1: fused kernels may write 64-bit realtime stamps (100 MHz) at kGrpProfOff; the region's
+    // previous use has finished (its command buffer was begun again, reset or freed): log them as deltas
     static const bool gprof = getenv("NVXRT_GROUP_PROFILE") && atoi(getenv("NVXRT_GROUP_PROFILE")) != 0;
     if (gprof) {
         const uint64_t *ts = (const uint64_t *)(reg + kGrpProfOff);
@@ -2088,8 +2191,10 @@ static bool launch_group(Device &dev, VkCommandBuffer cmd, CuFunction &fn, const
     dev.grp_recent.push_back({ri, g});
     if (dev.grp_recent.size() > 16)
         dev.grp_recent.pop_front();
-    if (g->members.size() > 1)
+    if (g->members.size() > 1) {
         dev.pending[cmd] = PendingGroup{g, 1, reg, dev.launch_count};
+        pending_changed(dev);
+    }
     return true;
 }
 
@@ -2143,9 +2248,10 @@ static VKAPI_ATTR void VKAPI_CALL CmdCuLaunchKernelNVX(VkCommandBuffer cmd, cons
     }
     if (!pbuf && li->paramCount && li->pParams) {
         // individual kernel parameters: lay them out per the translator's metadata
-        packed.assign(kPushBytes, 0);
+        packed.assign(std::max(kPushBytes, fn.meta.param_size), 0);
         for (size_t i = 0; i < li->paramCount && i < fn.meta.params.size(); i++)
-            memcpy(packed.data() + fn.meta.params[i].first, li->pParams[i], fn.meta.params[i].second);
+            if ((uint64_t)fn.meta.params[i].first + fn.meta.params[i].second <= packed.size())
+                memcpy(packed.data() + fn.meta.params[i].first, li->pParams[i], fn.meta.params[i].second);
         pbuf = packed.data();
         psize = fn.meta.param_size;
     }
@@ -2161,8 +2267,9 @@ static VKAPI_ATTR void VKAPI_CALL CmdCuLaunchKernelNVX(VkCommandBuffer cmd, cons
     }
     if (!g_exec || !dev->bindless_ok)
         return;
-    // NVXRT_SHADOW b/c: handles of shadowed images rewritten in a copy of the parameter block
-    uint8_t shadow_pbuf[kPushBytes + 256];
+    // NVXRT_SHADOW b/c: handles of shadowed images rewritten in a copy of the parameter block (any size the launch
+    // path accepts: a launch the shadow tracking does not see could write an original or read a stale one)
+    uint8_t shadow_pbuf[kBpSlot];
     if (pbuf && psize <= sizeof shadow_pbuf && (shadow_active(*dev) || g_shadow_log >= 2) &&
         shadow_params(*dev, cmd, fn, pbuf, psize, shadow_pbuf))
         pbuf = shadow_pbuf;
@@ -2212,12 +2319,20 @@ static VKAPI_ATTR void VKAPI_CALL CmdCuLaunchKernelNVX(VkCommandBuffer cmd, cons
             dev->bp_failed = !host_ring(*dev, (VkDeviceSize)kBpSlots * kBpSlot, dev->bp_buf, dev->bp_mem, ptr,
                                         dev->bp_addr, memtype);
             dev->bp_map = dev->bp_failed ? nullptr : (uint8_t *)ptr;
+            ring_init(dev->bp_free, kBpSlots);
             logf("big parameter ring: %s (%u x %u B, memory type %u)", dev->bp_failed ? "allocation FAILED" : "ok",
                  kBpSlots, kBpSlot, memtype);
         }
         if (!dev->bp_map || psize > kBpSlot)
             return;
-        uint32_t si = dev->bp_next++ % kBpSlots;
+        uint32_t si = 0;
+        if (!ring_take(*dev, &Device::CmdSlots::bp, cmd, si)) {
+            if (!dev->bp_full_logged)
+                logf("big parameter ring: all %u slots held by recorded command buffers; launch of %s skipped",
+                     kBpSlots, fn.name.c_str());
+            dev->bp_full_logged = true;
+            return;
+        }
         memcpy(dev->bp_map + (size_t)si * kBpSlot, pbuf, psize);
         VkDeviceAddress a = dev->bp_addr + (VkDeviceAddress)si * kBpSlot;
         memcpy(pc + 240, &a, sizeof a);
@@ -2869,6 +2984,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const Vk
         if (supported(name))
             exts.push_back(name);
     };
+    const uint32_t napp = (uint32_t)exts.size();   // the app's extensions without the NVX ones
     VkPhysicalDeviceProperties props;
     inst->d.GetPhysicalDeviceProperties(pd, &props);
     bool v13 = props.apiVersion >= VK_API_VERSION_1_3 &&
@@ -3026,7 +3142,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const Vk
         restore();
         if (r != VK_SUCCESS) {
             logf("CreateDevice with NVX support failed (%d); retrying without extras", r);
-            return create(pd, ci, a, out);
+            VkDeviceCreateInfo bci = *ci;   // the driver does not know the NVX extensions
+            bci.enabledExtensionCount = napp;
+            bci.ppEnabledExtensionNames = exts.data();
+            r = create(pd, &bci, a, out);
+            if (r != VK_SUCCESS)
+                return r;
+            // still registered below: GetDeviceProcAddr needs the Device to pass calls through
+            want_nvx = false;
         }
     } else {
         VkResult r = create(pd, &nci, a, out);
@@ -3065,6 +3188,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const Vk
     }
     std::lock_guard<std::mutex> lk(g_map_mutex);
     g_devices[dkey(*out)] = dev;
+    g_dev_gen.fetch_add(1, std::memory_order_release);
     return VK_SUCCESS;
 }
 
@@ -3127,11 +3251,180 @@ static VKAPI_ATTR void VKAPI_CALL DestroyDevice(VkDevice device, const VkAllocat
             dev->d.DestroyDescriptorSetLayout(device, dev->set_layout, nullptr);
             dev->d.DestroyBuffer(device, dev->smp_buf, nullptr);
             dev->d.FreeMemory(device, dev->smp_mem, nullptr);
+            // host-visible rings and the dump buffer (freeing the memory unmaps it)
+            for (VkBuffer b : {dev->grp_buf, dev->bp_buf, dev->dump_buf})
+                if (b)
+                    dev->d.DestroyBuffer(device, b, nullptr);
+            for (VkDeviceMemory m : {dev->grp_mem, dev->bp_mem, dev->dump_mem})
+                if (m)
+                    dev->d.FreeMemory(device, m, nullptr);
+            // companions of views the app never destroyed
+            for (auto &c : dev->companion)
+                dev->d.DestroyImageView(device, c.second, nullptr);
+            dev->companion.clear();
         }
     }
     dev->d.DestroyDevice(device, a);
     std::lock_guard<std::mutex> lk(g_map_mutex);
     g_devices.erase(dkey(device));
+    g_dev_gen.fetch_add(1, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------------------------- command buffers
+// Ring slot ownership (Device::cmd_slots): these are the calls after which a command buffer can no longer execute
+// what it recorded. The slots are released before the call goes down, so a handle the driver hands out again
+// at once starts clean.
+static VKAPI_ATTR VkResult VKAPI_CALL AllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo *ai,
+                                                             VkCommandBuffer *out)
+{
+    auto dev = device_of(device);
+    VkResult r = dev->d.AllocateCommandBuffers(device, ai, out);
+    if (r == VK_SUCCESS) {
+        std::lock_guard<std::mutex> lk(dev->mutex);
+        for (uint32_t i = 0; i < ai->commandBufferCount; i++)
+            dev->cmd_pool[out[i]] = ai->commandPool;
+    }
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL FreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t n,
+                                                     const VkCommandBuffer *cmds)
+{
+    auto dev = device_of(device);
+    {
+        std::lock_guard<std::mutex> lk(dev->mutex);
+        for (uint32_t i = 0; i < n; i++)
+            if (cmds[i]) {
+                cmd_release(*dev, cmds[i]);
+                dev->cmd_pool.erase(cmds[i]);
+            }
+    }
+    dev->d.FreeCommandBuffers(device, pool, n, cmds);
+}
+
+// cmd_release for every command buffer of pool that holds slots or an open group. caller holds dev.mutex
+static void pool_release(Device &dev, VkCommandPool pool)
+{
+    std::vector<VkCommandBuffer> rel;
+    for (auto &c : dev.cmd_slots)
+        rel.push_back(c.first);
+    for (auto &c : dev.pending)
+        rel.push_back(c.first);
+    for (VkCommandBuffer c : rel) {
+        auto it = dev.cmd_pool.find(c);
+        if (it != dev.cmd_pool.end() && it->second == pool)
+            cmd_release(dev, c);
+    }
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL ResetCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags f)
+{
+    auto dev = device_of(device);
+    if (dev->n_cmd_slots.load(std::memory_order_relaxed) || dev->n_pending.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(dev->mutex);
+        pool_release(*dev, pool);
+    }
+    return dev->d.ResetCommandPool(device, pool, f);
+}
+
+static VKAPI_ATTR void VKAPI_CALL DestroyCommandPool(VkDevice device, VkCommandPool pool, const VkAllocationCallbacks *a)
+{
+    auto dev = device_of(device);
+    {
+        std::lock_guard<std::mutex> lk(dev->mutex);
+        pool_release(*dev, pool);
+        for (auto it = dev->cmd_pool.begin(); it != dev->cmd_pool.end();)
+            it = it->second == pool ? dev->cmd_pool.erase(it) : std::next(it);
+    }
+    dev->d.DestroyCommandPool(device, pool, a);
+}
+
+static void cmd_reset(Device &dev, VkCommandBuffer cmd)
+{
+    if (!dev.n_cmd_slots.load(std::memory_order_relaxed) && !dev.n_pending.load(std::memory_order_relaxed))
+        return;
+    std::lock_guard<std::mutex> lk(dev.mutex);
+    cmd_release(dev, cmd);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer cmd, const VkCommandBufferBeginInfo *bi)
+{
+    Device *dev = device_fast(cmd);
+    cmd_reset(*dev, cmd);
+    return dev->d.BeginCommandBuffer(cmd, bi);
+}
+
+// a launch group cannot continue past the end of its command buffer: closing it here keeps the hooks below on their
+// lock-free path while no group is being recorded
+static VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer cmd)
+{
+    Device *dev = device_fast(cmd);
+    if (dev->n_pending.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lk(dev->mutex);
+        if (dev->pending.erase(cmd))
+            pending_changed(*dev);
+    }
+    return dev->d.EndCommandBuffer(cmd);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer cmd, VkCommandBufferResetFlags f)
+{
+    Device *dev = device_fast(cmd);
+    cmd_reset(*dev, cmd);
+    return dev->d.ResetCommandBuffer(cmd, f);
+}
+
+// Commands that record work other than a cubin launch end an open launch group in their command buffer
+// (group_break). The patched vkd3d (0002) invalidates all of its state after a cubin launch, so whatever it records
+// next binds a pipeline first; render pass begins, transfers, clears and acceleration structure commands need none.
+template <typename P, P DeviceDispatch::*M, const char *Name> struct Brk;
+template <typename... A, void (VKAPI_PTR *DeviceDispatch::*M)(VkCommandBuffer, A...), const char *Name>
+struct Brk<void (VKAPI_PTR *)(VkCommandBuffer, A...), M, Name> {
+    static VKAPI_ATTR void VKAPI_CALL f(VkCommandBuffer cmd, A... a)
+    {
+        Device *dev = device_fast(cmd);
+        group_break(*dev, cmd, Name);
+        (dev->d.*M)(cmd, a...);
+    }
+};
+#define BRK_FUNCS(X)                                                                                               \
+    X(CmdBindPipeline) X(CmdBeginRenderPass) X(CmdBeginRenderPass2) X(CmdBeginRendering) X(CmdCopyBuffer)           \
+    X(CmdCopyBuffer2) X(CmdFillBuffer) X(CmdUpdateBuffer) X(CmdClearDepthStencilImage) X(CmdCopyQueryPoolResults)   \
+    X(CmdExecuteCommands) X(CmdBuildAccelerationStructuresKHR) X(CmdBuildAccelerationStructuresIndirectKHR)          \
+    X(CmdCopyAccelerationStructureKHR) X(CmdCopyAccelerationStructureToMemoryKHR)                                  \
+    X(CmdCopyMemoryToAccelerationStructureKHR)
+// the image commands NVXRT_SHADOW hooks anyway (those hooks call group_break themselves)
+#define BRK_IMAGE_FUNCS(X)                                                                                         \
+    X(CmdCopyImage) X(CmdCopyImage2) X(CmdBlitImage) X(CmdBlitImage2) X(CmdResolveImage) X(CmdResolveImage2)        \
+    X(CmdClearColorImage) X(CmdCopyImageToBuffer) X(CmdCopyImageToBuffer2) X(CmdCopyBufferToImage)                 \
+    X(CmdCopyBufferToImage2)
+#define X(n) static constexpr char kBrk##n[] = "vk" #n;
+BRK_FUNCS(X)
+BRK_IMAGE_FUNCS(X)
+#undef X
+
+static PFN_vkVoidFunction brk_func(Device &dev, const char *name)
+{
+    // core 1.2/1.3 commands under their extension names
+    static const char *const kAlias[][2] = {
+        {"vkCmdBeginRenderPass2KHR", "vkCmdBeginRenderPass2"}, {"vkCmdBeginRenderingKHR", "vkCmdBeginRendering"},
+        {"vkCmdCopyBuffer2KHR", "vkCmdCopyBuffer2"}, {"vkCmdCopyImage2KHR", "vkCmdCopyImage2"},
+        {"vkCmdBlitImage2KHR", "vkCmdBlitImage2"}, {"vkCmdResolveImage2KHR", "vkCmdResolveImage2"},
+        {"vkCmdCopyImageToBuffer2KHR", "vkCmdCopyImageToBuffer2"},
+        {"vkCmdCopyBufferToImage2KHR", "vkCmdCopyBufferToImage2"},
+    };
+    for (auto &al : kAlias)
+        if (!strcmp(name, al[0]))
+            name = al[1];
+#define X(n)                                                                                                       \
+    if (!strcmp(name, "vk" #n))                                                                                    \
+        return dev.d.n ? (PFN_vkVoidFunction)Brk<PFN_vk##n, &DeviceDispatch::n, kBrk##n>::f : nullptr;
+    BRK_FUNCS(X)
+    if (!g_shadow) {
+        BRK_IMAGE_FUNCS(X)
+    }
+#undef X
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------------------------- proc addr
@@ -3195,6 +3488,15 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice devic
     if (dev->bindless_ok)
         if (auto f = device_func(name))
             return f;
+    if (dev->bindless_ok) {
+#define F(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)n;
+        F(AllocateCommandBuffers) F(FreeCommandBuffers) F(ResetCommandPool) F(DestroyCommandPool)
+        F(BeginCommandBuffer) F(EndCommandBuffer) F(ResetCommandBuffer)
+#undef F
+        if (!dev->groups.empty())
+            if (auto f = brk_func(*dev, name))
+                return f;
+    }
     // tracked core calls are needed even before NVX use (views created early)
     if (!strcmp(name, "vkCreateImageView")) return (PFN_vkVoidFunction)CreateImageView;
     if (!strcmp(name, "vkDestroyImageView")) return (PFN_vkVoidFunction)DestroyImageView;
