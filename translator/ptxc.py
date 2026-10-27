@@ -937,8 +937,15 @@ class Emitter:
             t = mods[-1]
             A(a[0], '%s ? %s : %s' % (V(a[3], 'pred'), V(a[1], t), V(a[2], t)), t); return
         if op in ('bar', 'barrier'):
+            # only full barriers: bar.warp.sync with a full mask, bar.sync / barrier.sync on barrier 0 without a
+            # thread count. bar.red (no destination written), bar.arrive (would block) and named or counted barriers
+            # (would wait for every thread) are not translated
             if 'warp' in ms:
+                if set(mods) - {'warp', 'sync'} or [x.strip().lower() for x in a] not in (['-1'], ['0xffffffff']):
+                    raise Err('barrier ' + ins.text)
                 self.line('subgroupMemoryBarrierShared(); subgroupBarrier();'); return
+            if set(mods) - {'sync', 'aligned', 'cta'} or 'sync' not in mods or [x.strip() for x in a] != ['0']:
+                raise Err('barrier ' + ins.text)
             self.line('controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsShared | gl_StorageSemanticsBuffer | gl_StorageSemanticsImage, gl_SemanticsAcquireRelease);')
             return
         if op == 'membar' or op == 'fence':
@@ -1306,7 +1313,12 @@ class Emitter:
             if dt == 'u16':
                 A(a[0], 'uint16_t(min(%s, 65535u))' % (f2u % f), 'u16'); return
             if dt == 's64':
-                A(a[0], 'int64_t(nvx_f2i(%s))' % f, 's64'); return
+                # saturates at the 64-bit limits (2^63 is exact in fp32), NaN -> 0
+                t = self.newtmp()
+                self.line('float %s = %s;' % (t, f))
+                A(a[0], 'isnan({0}) ? 0l : {0} >= 9223372036854775808.0 ? 9223372036854775807l : '
+                        '{0} <= -9223372036854775808.0 ? (-9223372036854775807l - 1l) : int64_t({0})'.format(t), 's64')
+                return
             raise Err('cvt ' + ins.text)
         # int -> int
         def width(t):
@@ -2318,7 +2330,7 @@ def hw_filter_source(glsl):
 HW_FILTER_ENTRIES = ('Kernel_BlendCandidatesFused', 'Kernel_BlendCandidatesFGLite', 'Kernel_WarpBlendingWeights',
                      'Kernel_DL1Net_Input')
 
-_HU_LOAD = re.compile(r'\b(r_\w+) = nvx_p(64|32|16|8)\((?:uint\(r_\w+\) \+ )?(\d+)u\)')
+_HU_LOAD = re.compile(r'\b(r_\w+) = nvx_p(64|32|16|8)\((?:uint\((r_\w+)\) \+ )?(\d+)u\)')
 _HU_DYN = re.compile(r'nvx_p(?:64|32|16|8)\((?!(?:uint\(r_\w+\) \+ )?\d+u\))')
 _HU_COPY = re.compile(r'\b(r_\w+) = (r_\w+);')
 _HU_CALL = re.compile(r'\b(nvx_tex\w*|nvx_utex\w*|nvx_sust\w*|nvx_suld\w*)\((r_\w+)\b')
@@ -2334,9 +2346,25 @@ def handle_meta(glsl):
     body = glsl[i + len(rt):] if i >= 0 else glsl[max(0, glsl.find('void main()')):]
     if _HU_DYN.search(body):
         return ['huse_dynamic 1']
+    # ld.param through a register (param_base): the register holds a parameter's byte offset, which the slot is
+    # relative to. Only a register assigned one constant (directly or through register copies) gives static slots.
+    def const_reg(r, depth=0):
+        vals = set(re.findall(r'^\s*%s = ([^;]*);' % r, body, re.M))
+        if len(vals) != 1 or depth > 16:
+            return None
+        v = vals.pop()
+        m = re.match(r'^(\d+)ul?$', v)
+        if m:
+            return int(m.group(1))
+        return const_reg(v, depth + 1) if re.match(r'^r_\w+$', v) else None
+    base_off = {}
+    for b in set(b for v, n, b, o in _HU_LOAD.findall(body) if b):
+        base_off[b] = const_reg(b)
+        if base_off[b] is None:
+            return ['huse_dynamic 1']
     var_offs, partial = {}, {}
-    for v, n, o in _HU_LOAD.findall(body):
-        o = int(o)
+    for v, n, b, o in _HU_LOAD.findall(body):
+        o = int(o) + base_off.get(b, 0)
         if n == '64' and o % 8 == 0:
             var_offs.setdefault(v, set()).add(o)
         else:
